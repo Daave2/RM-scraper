@@ -131,9 +131,6 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         app_logger.warning("Error verifying session; assuming login required.")
         return True
 
-#
-# *** THIS FUNCTION HAS BEEN UPDATED TO HANDLE THE 'CONTINUE SHOPPING' INTERSTITIAL PAGE ***
-#
 async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
@@ -145,7 +142,6 @@ async def perform_login(page: Page) -> bool:
         
         await page.get_by_label("Continue").click()
 
-        # After clicking continue, wait for EITHER the password field OR the interstitial page
         password_selector = 'input#ap_password'
         continue_shopping_selector = 'button:has-text("Continue shopping")'
         
@@ -155,19 +151,16 @@ async def perform_login(page: Page) -> bool:
             timeout=WAIT_TIMEOUT
         )
 
-        # If the interstitial page appeared, click the button to proceed
         if await page.locator(continue_shopping_selector).is_visible():
             app_logger.info("Interstitial page detected. Clicking 'Continue shopping'.")
             await page.locator(continue_shopping_selector).click()
 
-        # Now we can safely expect the password input to be visible
         pw_input = page.get_by_label("Password")
         await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
         await pw_input.fill(config['login_password'])
 
         await page.get_by_label("Sign in").click()
 
-        # The rest of the logic remains the same
         otp_sel  = 'input[id*="otp"]'
         dash_sel = "#content"
         acct_sel = 'h1:has-text("Select an account")'
@@ -351,8 +344,12 @@ async def post_to_webhook(url: str, payload: dict, store_name: str, hook_type: s
 
 async def post_store_report(data: dict):
     overall, shoppers = data.get("overall"), data.get("shoppers")
-    store_name = overall.get("store", "Unknown Store")
+    full_store_name = overall.get("store", "Unknown Store")
     timestamp = datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M")
+    
+    # *** CHANGE 1: Shorten store name for the title ***
+    # e.g., "Morrisons - Preston" becomes "Preston"
+    short_store_name = full_store_name.split(' - ')[-1] if ' - ' in full_store_name else full_store_name
     
     if not shoppers:
         summary_text = "No active shoppers found for this period."
@@ -382,11 +379,16 @@ async def post_store_report(data: dict):
     if shoppers:
         sections.append({"header": f"Per-Shopper Breakdown ({len(shoppers)})", "collapsible": True, "widgets": shopper_widgets})
 
-    payload = {"cardsV2": [{"cardId": f"store-summary-{store_name.replace(' ', '-')}", "card": {
-        "header": {"title": f"Amazon Metrics - {store_name}", "subtitle": timestamp, "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType": "CIRCLE"},
+    payload = {"cardsV2": [{"cardId": f"store-summary-{full_store_name.replace(' ', '-')}", "card": {
+        "header": {
+            "title": short_store_name,  # Use the shortened name here
+            "subtitle": timestamp,
+            "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
+            "imageType": "CIRCLE"
+        },
         "sections": sections
     }}]}
-    await post_to_webhook(CHAT_WEBHOOK_URL, payload, store_name, "per-store")
+    await post_to_webhook(CHAT_WEBHOOK_URL, payload, full_store_name, "per-store")
 
 async def post_aggregate_summary(results: list):
     successful_results = [r for r in results if r and r.get("shoppers")]
@@ -418,10 +420,22 @@ async def post_aggregate_summary(results: list):
                     f"• <b>Total Orders:</b> {total_orders}")
 
     payload = {"cardsV2": [{"cardId": "fleet-summary", "card": {
-        "header": {"title": "Amazon Fleet Performance Summary", "subtitle": f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores", "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType": "CIRCLE"},
+        "header": {
+            # *** CHANGE 2: Updated summary title ***
+            "title": "Amazon North West Summary", 
+            "subtitle": f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores",
+            "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
+            "imageType": "CIRCLE"
+        },
         "sections": [
             {"header": "Fleet-Wide Performance (Weighted Avg)", "widgets": [{"textParagraph": {"text": summary_text}}]},
-            {"header": "Per-Store Breakdown", "collapsible": True, "uncollapsibleWidgetsCount": 1, "widgets": store_widgets}
+            {
+                "header": "Per-Store Breakdown",
+                "collapsible": True,
+                # *** CHANGE 3: Show all stores by default ***
+                "uncollapsibleWidgetsCount": len(store_widgets),
+                "widgets": store_widgets
+            }
         ]
     }}]}
     await post_to_webhook(SUMMARY_CHAT_WEBHOOK_URL, payload, "Fleet", "summary")
