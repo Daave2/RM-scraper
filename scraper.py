@@ -116,18 +116,16 @@ def ensure_storage_state() -> bool:
         return False
 
 async def check_if_login_needed(page: Page, test_url: str) -> bool:
-    app_logger.info("Verifying session...")
     try:
         await page.goto(test_url, timeout=PAGE_TIMEOUT, wait_until="load")
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        # *** NEW: Universal check for any logged-in page ***
-        await expect(page.locator('a[href*="https://sellercentral.amazon.co.uk/help"]')).to_be_visible(timeout=WAIT_TIMEOUT)
+        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Existing session still valid.")
         return False
-    except Exception:
-        app_logger.warning("Error verifying session; assuming login required.")
+    except Exception as e:
+        app_logger.warning(f"Verification check failed: {e}. Assuming login is required.")
         return True
 
 async def perform_login(page: Page) -> bool:
@@ -165,29 +163,45 @@ async def perform_login(page: Page) -> bool:
         await _save_screenshot(page, "login_failure")
         return False
 
+#
+# *** YOUR SUPERIOR LOGIC IMPLEMENTED HERE ***
+#
 async def prime_master_session() -> bool:
     global browser
     app_logger.info("Priming master session")
     ctx = await browser.new_context()
+    page = await ctx.new_page()
+
     try:
-        page = await ctx.new_page()
         if not await perform_login(page):
             return False
+
+        first_store = TARGET_STORES[0]
+        test_url = (
+            f"https://sellercentral.amazon.co.uk/snowdash"
+            f"?mons_sel_dir_mcid={first_store['merchant_id']}"
+            f"&mons_sel_mkid={first_store['marketplace_id']}"
+        )
+        app_logger.info(f"Verifying session by navigating to dashboard: {test_url}")
         
-        # *** NEW: Universal Verification Step ***
-        app_logger.info("Verifying session by checking for universal navigation elements.")
-        await expect(page.locator('a[href*="https://sellercentral.amazon.co.uk/help"]')).to_be_visible(timeout=WAIT_TIMEOUT)
-        app_logger.info("Session successfully verified.")
+        login_needed = await check_if_login_needed(page, test_url)
+        if login_needed:
+            app_logger.critical("Session verification failed: still requires login after login flow.")
+            await _save_screenshot(page, "session_verification_failure")
+            return False
 
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
         return True
+
     except Exception as e:
-        app_logger.critical(f"Session verification failed after login actions: {e}", exc_info=True)
-        await _save_screenshot(page, "session_verification_failure")
+        app_logger.critical(f"An unexpected error occurred during session priming: {e}", exc_info=True)
+        await _save_screenshot(page, "session_priming_error")
         return False
+
     finally:
         await ctx.close()
+
 
 # =======================================================================================
 #                       CORE SCRAPING LOGIC
