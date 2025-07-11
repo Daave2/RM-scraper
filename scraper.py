@@ -2,7 +2,7 @@
 #         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
 # - Scrapes all stores first, then sends all notifications in a batch.
-# - Simplified INF scraping to be faster and more reliable.
+# - Includes highly robust login logic inspired by multiple versions.
 # - Posts a detailed, combined report for each store to a chat webhook.
 # - Posts a final aggregate summary for all stores.
 # =======================================================================================
@@ -96,7 +96,7 @@ log_lock   = asyncio.Lock()
 
 
 # =======================================================================================
-#    AUTHENTICATION & SESSION MANAGEMENT
+#    AUTHENTICATION & SESSION MANAGEMENT (UPGRADED LOGIC)
 # =======================================================================================
 async def _save_screenshot(page: Page | None, prefix: str):
     if not page or page.is_closed(): return
@@ -121,8 +121,7 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        # Check for a known element on either the metrics or INF dashboard
-        await expect(page.locator("#dashboard-title-component-id, #range-selector")).to_be_visible(timeout=WAIT_TIMEOUT)
+        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Existing session still valid.")
         return False
     except Exception:
@@ -133,54 +132,46 @@ async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
         await page.goto(LOGIN_URL, timeout=PAGE_TIMEOUT, wait_until="load")
-
-        # Handle multiple possible starting pages
+        
+        # *** NEW LOGIC: Handle multiple possible starting pages, inspired by auth.py ***
         email_sel = "input#ap_email"
         continue_btn = 'button:has-text("Continue shopping")'
         continue_input = 'input[type="submit"][aria-labelledby="continue-announce"]'
-
         await page.wait_for_selector(f"{email_sel}, {continue_btn}, {continue_input}", timeout=WAIT_TIMEOUT)
 
         if await page.locator(continue_btn).is_visible():
-            app_logger.info("Initial 'Continue shopping' interstitial found. Clicking it.")
             await page.locator(continue_btn).click()
         elif await page.locator(continue_input).is_visible():
-            app_logger.info("Initial 'Continue' interstitial input found. Clicking it.")
             await page.locator(continue_input).click()
         
-        email_input = page.get_by_label("Email or mobile phone number")
-        await expect(email_input).to_be_visible(timeout=WAIT_TIMEOUT)
-        await email_input.fill(config['login_email'])
+        # Enter email and password
+        await page.get_by_label("Email or mobile phone number").fill(config['login_email'])
         await page.get_by_label("Continue").click()
-        
-        password_selector = 'input#ap_password'
-        await page.wait_for_selector(f"{password_selector}, {continue_btn}", timeout=WAIT_TIMEOUT)
-        if await page.locator(continue_btn).is_visible():
-            app_logger.info("Interstitial page after email found. Clicking 'Continue shopping'.")
-            await page.locator(continue_btn).click()
-        
-        pw_input = page.get_by_label("Password")
-        await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
-        await pw_input.fill(config['login_password'])
+        await page.get_by_label("Password").fill(config['login_password'])
         await page.get_by_label("Sign in").click()
 
-        otp_sel  = 'input[id*="otp"]'
-        dash_sel = "#dashboard-title-component-id, #range-selector"
+        # Handle OTP, account picker, or successful login
+        otp_sel = 'input[id*="otp"]'
         acct_sel = 'h1:has-text("Select an account")'
-        await page.wait_for_selector(f"{otp_sel}, {dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
+        dash_sel = "#sc-app-container" # A generic container for any dashboard page
+        await page.wait_for_selector(f"{otp_sel}, {acct_sel}, {dash_sel}", timeout=WAIT_TIMEOUT)
+
         if await page.locator(otp_sel).is_visible():
+            app_logger.info("OTP challenge detected.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
             await page.locator(otp_sel).fill(code)
             await page.get_by_role("button", name="Sign in").click()
-            await page.wait_for_selector(f"{dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
+            await page.wait_for_selector(f"{acct_sel}, {dash_sel}", timeout=WAIT_TIMEOUT)
         
+        # *** NEW LOGIC: Treat account picker as a recoverable state, not a failure ***
         if await page.locator(acct_sel).is_visible():
-            app_logger.error("Account-picker page was displayed. This should be handled by direct navigation.")
-            await _save_screenshot(page, "login_account_picker")
-        
+            app_logger.warning("Account-picker page detected. Login is considered successful; direct navigation will handle it.")
+            return True
+
         await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Login successful.")
         return True
+
     except Exception as e:
         app_logger.critical(f"Login failed: {e}", exc_info=DEBUG_MODE)
         await _save_screenshot(page, "login_failure")
@@ -191,7 +182,16 @@ async def prime_master_session() -> bool:
     app_logger.info("Priming master session")
     ctx = await browser.new_context()
     try:
-        if not await perform_login(await ctx.new_page()): return False
+        page = await ctx.new_page()
+        if not await perform_login(page):
+            return False
+        
+        # *** NEW LOGIC: Session Finalization inspired by auth.py ***
+        app_logger.info("Finalizing session by visiting the first store's dashboard.")
+        first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
+        await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
+        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
+
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
         return True
@@ -221,21 +221,15 @@ async def scrape_store_metrics(page: Page, store_info: dict) -> dict | None:
     try:
         dash_url = (f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={store_info['merchant_id']}&mons_sel_mkid={store_info['marketplace_id']}")
         await page.goto(dash_url, timeout=PAGE_TIMEOUT)
-        refresh_button = page.get_by_role("button", name="Refresh")
-        await expect(refresh_button).to_be_visible(timeout=WAIT_TIMEOUT)
-        customised_tab = page.locator("#content span:has-text('Customised')").nth(0)
-        await customised_tab.click(timeout=ACTION_TIMEOUT)
-        date_picker = page.locator("kat-date-range-picker")
-        await expect(date_picker).to_be_visible(timeout=WAIT_TIMEOUT)
+        await expect(page.get_by_role("button", name="Refresh")).to_be_visible(timeout=WAIT_TIMEOUT)
+        await page.locator("#content span:has-text('Customised')").nth(0).click(timeout=ACTION_TIMEOUT)
+        await expect(page.locator("kat-date-range-picker")).to_be_visible(timeout=WAIT_TIMEOUT)
         now = datetime.now(LOCAL_TIMEZONE).strftime("%m/%d/%Y")
-        date_inputs = date_picker.locator('input[type="text"]')
+        date_inputs = page.locator('kat-date-range-picker input[type="text"]')
         await date_inputs.nth(0).fill(now); await date_inputs.nth(1).fill(now)
-        apply_btn = page.get_by_role("button", name="Apply")
-        async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=30000):
-            await apply_btn.click(timeout=ACTION_TIMEOUT)
-        async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=40000) as refresh_info:
-            await refresh_button.click(timeout=ACTION_TIMEOUT)
-        api_data = await (await refresh_info.value).json()
+        async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=40000) as response_info:
+            await page.get_by_role("button", name="Apply").click(timeout=ACTION_TIMEOUT)
+        api_data = await (await response_info.value).json()
         app_logger.info(f"Received METRICS API response for {store_name}.")
         
         shopper_stats, store_totals = [], {'units':0, 'time':0, 'orders':0, 'req_units':0, 'inf_items':0, 'lates':0}
@@ -282,20 +276,10 @@ async def scrape_inf_data(page: Page, store_info: dict) -> list[dict] | None:
             return []
         
         first_row_before_sort = await page.locator(f"{table_sel} tr").first.text_content()
-
         app_logger.info(f"Sorting table by 'INF Units' for '{store_name}'")
         await page.locator("#sort-3").click()
-
         try:
-            await page.wait_for_function(
-                expression="""(args) => {
-                    const [selector, initialText] = args;
-                    const firstRow = document.querySelector(selector);
-                    return firstRow && firstRow.textContent !== initialText;
-                }""",
-                arg=[f"{table_sel} tr", first_row_before_sort],
-                timeout=20000
-            )
+            await page.wait_for_function(expression="(args) => { const [selector, initialText] = args; const firstRow = document.querySelector(selector); return firstRow && firstRow.textContent !== initialText; }", arg=[f"{table_sel} tr", first_row_before_sort], timeout=20000)
             app_logger.info("Table sort confirmed by DOM change.")
         except TimeoutError:
             app_logger.warning("Table content did not change after sort click. Proceeding with current data (might be pre-sorted or single-page).")
@@ -305,14 +289,7 @@ async def scrape_inf_data(page: Page, store_info: dict) -> list[dict] | None:
         for r in rows[:5]:
             cells = r.locator("td")
             thumb = await cells.nth(0).locator("img").get_attribute("src") or ""
-            items.append({
-                "image_url": re.sub(r"\._SS\d+_\.", f"._SS{SMALL_IMAGE_SIZE}_.", thumb),
-                "sku": await cells.nth(1).locator("span").inner_text(),
-                "product_name": await cells.nth(2).locator("a span").inner_text(),
-                "inf_units": await cells.nth(3).locator("span").inner_text(),
-                "orders_impacted": await cells.nth(4).locator("span").inner_text(),
-                "inf_pct": await cells.nth(8).locator("span").inner_text(),
-            })
+            items.append({"image_url": re.sub(r"\._SS\d+_\.", f"._SS{SMALL_IMAGE_SIZE}_.", thumb), "sku": await cells.nth(1).locator("span").inner_text(), "product_name": await cells.nth(2).locator("a span").inner_text(), "inf_units": await cells.nth(3).locator("span").inner_text(), "orders_impacted": await cells.nth(4).locator("span").inner_text(), "inf_pct": await cells.nth(8).locator("span").inner_text()})
         app_logger.info(f"Scraped top {len(items)} INF items for '{store_name}'")
         return items
     except Exception as e:
@@ -345,44 +322,29 @@ async def post_store_report(data: dict):
     short_store_name = full_store_name.split(' - ')[-1] if ' - ' in full_store_name else full_store_name
     
     sections = []
-    # Section 1: Overall Metrics
     if shoppers:
-        summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(overall.get('uph'), UPH_THRESHOLD, is_uph=True)}<br>"
-                        f"• <b>Lates:</b> {_format_metric_with_emoji(overall.get('lates'), LATES_THRESHOLD)}<br>"
-                        f"• <b>INF:</b> {_format_metric_with_emoji(overall.get('inf'), INF_THRESHOLD)}<br>"
-                        f"• <b>Orders:</b> {overall.get('orders')}")
+        summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(overall.get('uph'), UPH_THRESHOLD, is_uph=True)}<br>"f"• <b>Lates:</b> {_format_metric_with_emoji(overall.get('lates'), LATES_THRESHOLD)}<br>"f"• <b>INF:</b> {_format_metric_with_emoji(overall.get('inf'), INF_THRESHOLD)}<br>"f"• <b>Orders:</b> {overall.get('orders')}")
         sections.append({"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": summary_text}}]})
     else:
         sections.append({"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": "No active shoppers found for this period."}}]})
 
-    # Section 2: Shopper Breakdown
     if shoppers:
         shopper_widgets = []
         for s in shoppers:
-            uph = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True)
-            inf = _format_metric_with_color(f"<b>INF:</b> {s['inf']}", INF_THRESHOLD)
-            lates = _format_metric_with_color(f"<b>Lates:</b> {s['lates']}", LATES_THRESHOLD)
+            uph = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True); inf = _format_metric_with_color(f"<b>INF:</b> {s['inf']}", INF_THRESHOLD); lates = _format_metric_with_color(f"<b>Lates:</b> {s['lates']}", LATES_THRESHOLD)
             shopper_widgets.append({"decoratedText": {"icon":{"knownIcon":"PERSON"}, "topLabel":f"<b>{s['name']}</b> ({s['orders']} Orders)", "text":f"{uph} | {inf} | {lates}"}})
         sections.append({"header":f"Per-Shopper Breakdown ({len(shoppers)})", "collapsible":True, "widgets":shopper_widgets})
 
-    # Section 3: Top 5 INF Items
     if inf_items:
         inf_widgets = [{"divider": {}}]
         for it in inf_items:
-            code = urllib.parse.quote(it["sku"])
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size={QR_CODE_SIZE}x{QR_CODE_SIZE}&data={code}"
-            left_col = {"horizontalSizeStyle":"FILL_MINIMUM_SPACE", "horizontalAlignment":"CENTER", "verticalAlignment":"CENTER", "widgets":[{"image":{"imageUrl":qr_url, "altText":f"QR {it['sku']}"}}]}
-            right_col = {"horizontalSizeStyle":"FILL_AVAILABLE_SPACE", "widgets":[
-                {"textParagraph":{"text":f"<b>{it['product_name']}</b><br><b>SKU:</b> {it['sku']}<br><b>INF Units:</b> {it['inf_units']} ({it['inf_pct']}) | <b>Orders:</b> {it['orders_impacted']}"}},
-                {"image":{"imageUrl":it["image_url"], "altText":it["product_name"]}}
-            ]}
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size={QR_CODE_SIZE}x{QR_CODE_SIZE}&data={urllib.parse.quote(it['sku'])}"
+            left_col = {"horizontalSizeStyle":"FILL_MINIMUM_SPACE", "widgets":[{"image":{"imageUrl":qr_url}}]}
+            right_col = {"widgets":[{"textParagraph":{"text":f"<b>{it['product_name']}</b><br><b>SKU:</b> {it['sku']}<br><b>INF Units:</b> {it['inf_units']} ({it['inf_pct']}) | <b>Orders:</b> {it['orders_impacted']}"}}, {"image":{"imageUrl":it["image_url"]}}]}
             inf_widgets.extend([{"columns": {"columnItems": [left_col, right_col]}}, {"divider": {}}])
         sections.append({"header": f"Top {len(inf_items)} INF Items", "collapsible": True, "uncollapsibleWidgetsCount": 1, "widgets": inf_widgets})
 
-    payload = {"cardsV2": [{"cardId": f"store-report-{full_store_name.replace(' ', '-')}", "card": {
-        "header": {"title": short_store_name, "subtitle": timestamp, "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType": "CIRCLE"},
-        "sections": sections
-    }}]}
+    payload = {"cardsV2": [{"cardId": f"store-report-{full_store_name.replace(' ', '-')}", "card": {"header": {"title": short_store_name, "subtitle": timestamp, "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType": "CIRCLE"}, "sections": sections}}]}
     await post_to_webhook(CHAT_WEBHOOK_URL, payload, full_store_name, "per-store")
 
 async def post_aggregate_summary(results: list):
@@ -399,31 +361,17 @@ async def post_aggregate_summary(results: list):
         fleet_weighted_lates += float(re.sub(r'[^\d.]','',o.get('lates','0'))) * orders
         fleet_weighted_inf += float(re.sub(r'[^\d.]','',o.get('inf','0'))) * units
         
-        uph_f = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, True)
-        lates_f = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD)
-        inf_f = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
+        uph_f = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, True); lates_f = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD); inf_f = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
         metrics_text = f"{uph_f} | {lates_f} | {inf_f}"
-        
         store_widgets.append({"decoratedText": {"icon":{"knownIcon":"STORE"}, "topLabel":f"<b>{o['store']}</b> ({orders} Orders)", "text":metrics_text}})
-        
-        if inf_list:
-            store_widgets.append({"textParagraph": {"text": f"<i>Top INF: {inf_list[0]['product_name']}</i>"}})
-
-        if idx < len(successful_results) - 1:
-            store_widgets.append({"divider": {}})
+        if inf_list: store_widgets.append({"textParagraph": {"text": f"<i>Top INF: {inf_list[0]['product_name']}</i>"}})
+        if idx < len(successful_results) - 1: store_widgets.append({"divider": {}})
 
     fleet_uph = (total_units/(fleet_pick_time_sec/3600)) if fleet_pick_time_sec > 0 else 0
     fleet_lates = (fleet_weighted_lates/total_orders) if total_orders > 0 else 0
     fleet_inf = (fleet_weighted_inf/total_units) if total_units > 0 else 0
-    summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(f'{fleet_uph:.0f}', UPH_THRESHOLD, True)}<br>"
-                    f"• <b>Lates:</b> {_format_metric_with_emoji(f'{fleet_lates:.1f} %', LATES_THRESHOLD)}<br>"
-                    f"• <b>INF:</b> {_format_metric_with_emoji(f'{fleet_inf:.1f} %', INF_THRESHOLD)}<br>"
-                    f"• <b>Total Orders:</b> {total_orders}")
-
-    payload = {"cardsV2": [{"cardId": "fleet-summary", "card": {
-        "header": {"title": "Amazon North West Summary", "subtitle":f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores", "imageUrl":"https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType":"CIRCLE"},
-        "sections": [{"header": "Fleet-Wide Performance (Weighted Avg)", "widgets": [{"textParagraph": {"text": summary_text}}]}, {"header": "Per-Store Breakdown", "collapsible":True, "uncollapsibleWidgetsCount":len(store_widgets), "widgets":store_widgets}]
-    }}]}
+    summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(f'{fleet_uph:.0f}', UPH_THRESHOLD, True)}<br>"f"• <b>Lates:</b> {_format_metric_with_emoji(f'{fleet_lates:.1f} %', LATES_THRESHOLD)}<br>"f"• <b>INF:</b> {_format_metric_with_emoji(f'{fleet_inf:.1f} %', INF_THRESHOLD)}<br>"f"• <b>Total Orders:</b> {total_orders}")
+    payload = {"cardsV2": [{"cardId": "fleet-summary", "card": {"header": {"title": "Amazon North West Summary", "subtitle":f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores", "imageUrl":"https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType":"CIRCLE"}, "sections": [{"header": "Fleet-Wide Performance (Weighted Avg)", "widgets": [{"textParagraph": {"text": summary_text}}]}, {"header": "Per-Store Breakdown", "collapsible":True, "uncollapsibleWidgetsCount":len(store_widgets), "widgets":store_widgets}]}}]}
     await post_to_webhook(SUMMARY_CHAT_WEBHOOK_URL, payload, "Fleet", "summary")
 
 async def log_results(data: dict):
@@ -485,7 +433,6 @@ async def main():
             finally:
                 if ctx: await ctx.close()
         
-        # After all scraping is done, send notifications
         if all_results:
             app_logger.info(f"Scraping complete. Sending {len(all_results)} store reports...")
             for result in all_results:
