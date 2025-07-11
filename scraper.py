@@ -131,6 +131,9 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         app_logger.warning("Error verifying session; assuming login required.")
         return True
 
+#
+# *** THIS FUNCTION HAS BEEN UPDATED TO HANDLE THE 'CONTINUE SHOPPING' INTERSTITIAL PAGE ***
+#
 async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
@@ -142,12 +145,29 @@ async def perform_login(page: Page) -> bool:
         
         await page.get_by_label("Continue").click()
 
+        # After clicking continue, wait for EITHER the password field OR the interstitial page
+        password_selector = 'input#ap_password'
+        continue_shopping_selector = 'button:has-text("Continue shopping")'
+        
+        app_logger.info("Waiting for next step: password field or 'Continue shopping' interstitial...")
+        await page.wait_for_selector(
+            f"{password_selector}, {continue_shopping_selector}", 
+            timeout=WAIT_TIMEOUT
+        )
+
+        # If the interstitial page appeared, click the button to proceed
+        if await page.locator(continue_shopping_selector).is_visible():
+            app_logger.info("Interstitial page detected. Clicking 'Continue shopping'.")
+            await page.locator(continue_shopping_selector).click()
+
+        # Now we can safely expect the password input to be visible
         pw_input = page.get_by_label("Password")
         await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
         await pw_input.fill(config['login_password'])
 
         await page.get_by_label("Sign in").click()
 
+        # The rest of the logic remains the same
         otp_sel  = 'input[id*="otp"]'
         dash_sel = "#content"
         acct_sel = 'h1:has-text("Select an account")'
@@ -172,7 +192,6 @@ async def perform_login(page: Page) -> bool:
         app_logger.critical(f"Login failed: {e}", exc_info=DEBUG_MODE)
         await _save_screenshot(page, "login_failure")
         return False
-
 
 async def prime_master_session() -> bool:
     global browser
@@ -330,9 +349,6 @@ async def post_to_webhook(url: str, payload: dict, store_name: str, hook_type: s
     except Exception as e:
         app_logger.error(f"Error posting to {hook_type} webhook for {store_name}: {e}", exc_info=True)
 
-#
-# *** THIS FUNCTION HAS BEEN REFACTORED FOR CLARITY AND TO FIX LINTER ERRORS ***
-#
 async def post_store_report(data: dict):
     overall, shoppers = data.get("overall"), data.get("shoppers")
     store_name = overall.get("store", "Unknown Store")
@@ -347,7 +363,6 @@ async def post_store_report(data: dict):
                         f"• <b>INF:</b> {_format_metric_with_emoji(overall.get('inf'), INF_THRESHOLD)}<br>"
                         f"• <b>Orders:</b> {overall.get('orders')}")
         
-        # Build the shopper widgets in a clear for-loop instead of a complex list comprehension
         shopper_widgets = []
         for s in shoppers:
             uph_formatted = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True)
