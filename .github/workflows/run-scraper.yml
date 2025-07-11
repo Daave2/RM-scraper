@@ -1,0 +1,58 @@
+name: Run Amazon Scraper
+
+on:
+  workflow_dispatch: # Allows manual runs from the Actions tab
+  schedule:
+    - cron: '0 14,20 * * *' # Runs at 14, and 20 UTC
+
+env:
+  PYTHON_VERSION: '3.11'
+  TZ: 'Europe/London' # Set timezone for the runner
+
+jobs:
+  run-scraper:
+    name: Run Scraper Job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Create config.json from secrets
+        run: |
+          # Important: secrets.TARGET_STORES_JSON is NOT in quotes
+          # to allow the JSON array to be injected correctly.
+          echo '{
+            "debug": false,
+            "login_url": "${{ secrets.LOGIN_URL }}",
+            "login_email": "${{ secrets.LOGIN_EMAIL }}",
+            "login_password": "${{ secrets.LOGIN_PASSWORD }}",
+            "otp_secret_key": "${{ secrets.OTP_SECRET_KEY }}",
+            "chat_webhook_url": "${{ secrets.CHAT_WEBHOOK_URL }}",
+            "summary_chat_webhook_url": "${{ secrets.SUMMARY_CHAT_WEBHOOK_URL }}",
+            "target_stores": ${{ secrets.TARGET_STORES_JSON }}
+          }' > config.json
+          
+          echo "config.json created successfully."
+
+      - name: Run the scraper script
+        run: python scraper.py
+
+      - name: Upload logs and output as artifacts
+        if: always() # Run this step even if the scraper fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-output-${{ github.run_id }}
+          path: |
+            app.log
+            output/
+          retention-days: 7
