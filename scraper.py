@@ -347,8 +347,6 @@ async def post_store_report(data: dict):
     full_store_name = overall.get("store", "Unknown Store")
     timestamp = datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M")
     
-    # *** CHANGE 1: Shorten store name for the title ***
-    # e.g., "Morrisons - Preston" becomes "Preston"
     short_store_name = full_store_name.split(' - ')[-1] if ' - ' in full_store_name else full_store_name
     
     if not shoppers:
@@ -381,7 +379,7 @@ async def post_store_report(data: dict):
 
     payload = {"cardsV2": [{"cardId": f"store-summary-{full_store_name.replace(' ', '-')}", "card": {
         "header": {
-            "title": short_store_name,  # Use the shortened name here
+            "title": short_store_name,
             "subtitle": timestamp,
             "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
             "imageType": "CIRCLE"
@@ -390,6 +388,9 @@ async def post_store_report(data: dict):
     }}]}
     await post_to_webhook(CHAT_WEBHOOK_URL, payload, full_store_name, "per-store")
 
+#
+# *** THIS FUNCTION HAS BEEN UPDATED TO COLOR-CODE THE STORE BREAKDOWN ***
+#
 async def post_aggregate_summary(results: list):
     successful_results = [r for r in results if r and r.get("shoppers")]
     if not SUMMARY_CHAT_WEBHOOK_URL or not successful_results: return
@@ -405,9 +406,18 @@ async def post_aggregate_summary(results: list):
         if uph > 0: fleet_pick_time_sec += (units / uph) * 3600
         fleet_weighted_lates += float(re.sub(r'[^\d.]', '', o.get('lates', '0'))) * orders
         fleet_weighted_inf += float(re.sub(r'[^\d.]', '', o.get('inf', '0'))) * units
+
+        # Apply color formatting to each metric for the store
+        uph_formatted = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, is_uph=True)
+        lates_formatted = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD)
+        inf_formatted = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
+        
+        metrics_text = f"{uph_formatted} | {lates_formatted} | {inf_formatted}"
+        
         store_widgets.append({"decoratedText": {
-            "icon": {"knownIcon": "STORE"}, "topLabel": f"<b>{o['store']}</b> ({orders} Orders)",
-            "text": f"<b>UPH:</b> {o.get('uph')} | <b>Lates:</b> {o.get('lates')} | <b>INF:</b> {o.get('inf')}"
+            "icon": {"knownIcon": "STORE"}, 
+            "topLabel": f"<b>{o['store']}</b> ({orders} Orders)",
+            "text": metrics_text # Use the new formatted text
         }})
 
     fleet_uph = (total_units / (fleet_pick_time_sec / 3600)) if fleet_pick_time_sec > 0 else 0
@@ -421,7 +431,6 @@ async def post_aggregate_summary(results: list):
 
     payload = {"cardsV2": [{"cardId": "fleet-summary", "card": {
         "header": {
-            # *** CHANGE 2: Updated summary title ***
             "title": "Amazon North West Summary", 
             "subtitle": f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores",
             "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
@@ -432,7 +441,6 @@ async def post_aggregate_summary(results: list):
             {
                 "header": "Per-Store Breakdown",
                 "collapsible": True,
-                # *** CHANGE 3: Show all stores by default ***
                 "uncollapsibleWidgetsCount": len(store_widgets),
                 "widgets": store_widgets
             }
