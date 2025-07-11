@@ -133,7 +133,6 @@ async def perform_login(page: Page) -> bool:
     try:
         await page.goto(LOGIN_URL, timeout=PAGE_TIMEOUT, wait_until="load")
         
-        # *** NEW LOGIC: Handle multiple possible starting pages, inspired by auth.py ***
         email_sel = "input#ap_email"
         continue_btn = 'button:has-text("Continue shopping")'
         continue_input = 'input[type="submit"][aria-labelledby="continue-announce"]'
@@ -144,31 +143,33 @@ async def perform_login(page: Page) -> bool:
         elif await page.locator(continue_input).is_visible():
             await page.locator(continue_input).click()
         
-        # Enter email and password
         await page.get_by_label("Email or mobile phone number").fill(config['login_email'])
         await page.get_by_label("Continue").click()
         await page.get_by_label("Password").fill(config['login_password'])
         await page.get_by_label("Sign in").click()
 
-        # Handle OTP, account picker, or successful login
         otp_sel = 'input[id*="otp"]'
         acct_sel = 'h1:has-text("Select an account")'
-        dash_sel = "#sc-app-container" # A generic container for any dashboard page
-        await page.wait_for_selector(f"{otp_sel}, {acct_sel}, {dash_sel}", timeout=WAIT_TIMEOUT)
+        dash_sel = "#sc-app-container"
+        shopper_perf_sel = 'h1:has-text("Shopper Performance")'
+        await page.wait_for_selector(f"{otp_sel}, {acct_sel}, {dash_sel}, {shopper_perf_sel}", timeout=WAIT_TIMEOUT)
 
         if await page.locator(otp_sel).is_visible():
             app_logger.info("OTP challenge detected.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
             await page.locator(otp_sel).fill(code)
             await page.get_by_role("button", name="Sign in").click()
-            await page.wait_for_selector(f"{acct_sel}, {dash_sel}", timeout=WAIT_TIMEOUT)
+            # *** NEW LOGIC: Wait for ANY of the possible next pages after OTP ***
+            await page.wait_for_selector(f"{acct_sel}, {dash_sel}, {shopper_perf_sel}", timeout=WAIT_TIMEOUT)
         
-        # *** NEW LOGIC: Treat account picker as a recoverable state, not a failure ***
         if await page.locator(acct_sel).is_visible():
             app_logger.warning("Account-picker page detected. Login is considered successful; direct navigation will handle it.")
-            return True
+        elif await page.locator(shopper_perf_sel).is_visible():
+            app_logger.warning("Landed on Shopper Performance page. Login is considered successful.")
+        else:
+            await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
+            app_logger.info("Landed on a recognized dashboard page.")
 
-        await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Login successful.")
         return True
 
@@ -186,7 +187,6 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
         
-        # *** NEW LOGIC: Session Finalization inspired by auth.py ***
         app_logger.info("Finalizing session by visiting the first store's dashboard.")
         first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
         await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
