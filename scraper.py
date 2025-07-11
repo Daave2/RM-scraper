@@ -2,7 +2,7 @@
 #         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
 # - Scrapes all stores first, then sends all notifications in a batch.
-# - Includes highly robust login logic inspired by multiple versions.
+# - Includes highly robust login logic to handle multiple landing pages.
 # - Posts a detailed, combined report for each store to a chat webhook.
 # - Posts a final aggregate summary for all stores.
 # =======================================================================================
@@ -149,28 +149,36 @@ async def perform_login(page: Page) -> bool:
         await page.get_by_label("Sign in").click()
 
         otp_sel = 'input[id*="otp"]'
+        # *** NEW LOGIC: Define all possible successful post-login pages ***
         acct_sel = 'h1:has-text("Select an account")'
-        dash_sel = "#sc-app-container"
+        metrics_dash_sel = '#dashboard-title-component-id'
+        inf_dash_sel = '#range-selector'
         shopper_perf_sel = 'h1:has-text("Shopper Performance")'
-        await page.wait_for_selector(f"{otp_sel}, {acct_sel}, {dash_sel}, {shopper_perf_sel}", timeout=WAIT_TIMEOUT)
+        
+        possible_landing_pages = f"{otp_sel}, {acct_sel}, {metrics_dash_sel}, {inf_dash_sel}, {shopper_perf_sel}"
+        await page.wait_for_selector(possible_landing_pages, timeout=WAIT_TIMEOUT)
 
         if await page.locator(otp_sel).is_visible():
             app_logger.info("OTP challenge detected.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
             await page.locator(otp_sel).fill(code)
             await page.get_by_role("button", name="Sign in").click()
-            # *** NEW LOGIC: Wait for ANY of the possible next pages after OTP ***
-            await page.wait_for_selector(f"{acct_sel}, {dash_sel}, {shopper_perf_sel}", timeout=WAIT_TIMEOUT)
+            await page.wait_for_selector(possible_landing_pages.replace(f"{otp_sel}, ", ""), timeout=WAIT_TIMEOUT)
         
         if await page.locator(acct_sel).is_visible():
-            app_logger.warning("Account-picker page detected. Login is considered successful; direct navigation will handle it.")
+            app_logger.warning("Landed on Account-picker page. Login successful.")
         elif await page.locator(shopper_perf_sel).is_visible():
-            app_logger.warning("Landed on Shopper Performance page. Login is considered successful.")
+            app_logger.warning("Landed on Shopper Performance page. Login successful.")
+        elif await page.locator(metrics_dash_sel).is_visible():
+             app_logger.info("Landed on Metrics dashboard. Login successful.")
+        elif await page.locator(inf_dash_sel).is_visible():
+             app_logger.info("Landed on INF dashboard. Login successful.")
         else:
-            await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
-            app_logger.info("Landed on a recognized dashboard page.")
+            # This case should ideally not be reached if the selectors are correct
+            app_logger.error("Landed on an unrecognized page after login.")
+            raise TimeoutError("Could not confirm a successful login state.")
 
-        app_logger.info("Login successful.")
+        app_logger.info("Login flow completed successfully.")
         return True
 
     except Exception as e:
@@ -187,7 +195,7 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
         
-        app_logger.info("Finalizing session by visiting the first store's dashboard.")
+        app_logger.info("Finalizing session by visiting the first store's metrics dashboard.")
         first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
         await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
         await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
