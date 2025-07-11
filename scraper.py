@@ -61,7 +61,7 @@ except FileNotFoundError:
     exit(1)
 
 DEBUG_MODE               = config.get('debug', False)
-LOGIN_URL                = config.get('login_url')
+LOGIN_URL                = config.get('login_url', "https://sellercentral.amazon.co.uk/ap/signin")
 CHAT_WEBHOOK_URL         = config.get('chat_webhook_url')
 SUMMARY_CHAT_WEBHOOK_URL = config.get('summary_chat_webhook_url')
 TARGET_STORES            = config.get('target_stores', []) 
@@ -135,23 +135,36 @@ async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
         await page.goto(LOGIN_URL, timeout=PAGE_TIMEOUT, wait_until="load")
-        await page.get_by_label("Email or mobile phone number").fill(config['login_email'])
+
+        email_input = page.get_by_label("Email or mobile phone number")
+        await expect(email_input).to_be_visible(timeout=WAIT_TIMEOUT)
+        await email_input.fill(config['login_email'])
+        
         await page.get_by_label("Continue").click()
 
-        pw = page.get_by_label("Password")
-        await expect(pw).to_be_visible(timeout=WAIT_TIMEOUT)
-        await pw.fill(config['login_password'])
+        pw_input = page.get_by_label("Password")
+        await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
+        await pw_input.fill(config['login_password'])
+
         await page.get_by_label("Sign in").click()
 
         otp_sel  = 'input[id*="otp"]'
         dash_sel = "#content"
-        await page.wait_for_selector(f"{otp_sel}, {dash_sel}", timeout=WAIT_TIMEOUT)
+        acct_sel = 'h1:has-text("Select an account")'
+        await page.wait_for_selector(f"{otp_sel}, {dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
 
         if await page.locator(otp_sel).is_visible():
+            app_logger.info("OTP challenge detected. Entering code.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
             await page.locator(otp_sel).fill(code)
             await page.get_by_role("button", name="Sign in").click()
+            await page.wait_for_selector(f"{dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
         
+        if await page.locator(acct_sel).is_visible():
+            app_logger.error("Account-picker page was displayed after login. The script cannot proceed.")
+            await _save_screenshot(page, "login_account_picker")
+            return False
+
         await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Login successful.")
         return True
@@ -159,6 +172,7 @@ async def perform_login(page: Page) -> bool:
         app_logger.critical(f"Login failed: {e}", exc_info=DEBUG_MODE)
         await _save_screenshot(page, "login_failure")
         return False
+
 
 async def prime_master_session() -> bool:
     global browser
@@ -294,7 +308,8 @@ async def scrape_store_data(browser: Browser, store_info: dict, storage_state: d
         except Exception as e:
             app_logger.warning(f"Attempt {attempt+1} failed for {store_name}: {e}", exc_info=True)
             if attempt == WORKER_RETRY_COUNT - 1:
-                await _save_screenshot(getattr(ctx, 'pages', [None])[0], f"{store_name}_error")
+                page_to_screenshot = next(iter(ctx.pages), None) if ctx else None
+                await _save_screenshot(page_to_screenshot, f"{store_name}_error")
         finally:
             if ctx: await ctx.close()
     app_logger.error(f"All attempts failed for {store_name}.")
@@ -315,6 +330,9 @@ async def post_to_webhook(url: str, payload: dict, store_name: str, hook_type: s
     except Exception as e:
         app_logger.error(f"Error posting to {hook_type} webhook for {store_name}: {e}", exc_info=True)
 
+#
+# *** THIS FUNCTION HAS BEEN REFACTORED FOR CLARITY AND TO FIX LINTER ERRORS ***
+#
 async def post_store_report(data: dict):
     overall, shoppers = data.get("overall"), data.get("shoppers")
     store_name = overall.get("store", "Unknown Store")
@@ -328,11 +346,22 @@ async def post_store_report(data: dict):
                         f"• <b>Lates:</b> {_format_metric_with_emoji(overall.get('lates'), LATES_THRESHOLD)}<br>"
                         f"• <b>INF:</b> {_format_metric_with_emoji(overall.get('inf'), INF_THRESHOLD)}<br>"
                         f"• <b>Orders:</b> {overall.get('orders')}")
-        shopper_widgets = [{
-            "decoratedText": {
-                "icon": {"knownIcon": "PERSON"}, "topLabel": f"<b>{s['name']}</b> ({s['orders']} Orders)",
-                "text": f"{_format_metric_with_color(f'<b>UPH:</b> {s['uph']}', UPH_THRESHOLD, True)} | {_format_metric_with_color(f'<b>INF:</b> {s['inf']}', INF_THRESHOLD)} | {_format_metric_with_color(f'<b>Lates:</b> {s['lates']}', LATES_THRESHOLD)}"
-            }} for s in shoppers]
+        
+        # Build the shopper widgets in a clear for-loop instead of a complex list comprehension
+        shopper_widgets = []
+        for s in shoppers:
+            uph_formatted = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True)
+            inf_formatted = _format_metric_with_color(f"<b>INF:</b> {s['inf']}", INF_THRESHOLD)
+            lates_formatted = _format_metric_with_color(f"<b>Lates:</b> {s['lates']}", LATES_THRESHOLD)
+            
+            widget = {
+                "decoratedText": {
+                    "icon": {"knownIcon": "PERSON"},
+                    "topLabel": f"<b>{s['name']}</b> ({s['orders']} Orders)",
+                    "text": f"{uph_formatted} | {inf_formatted} | {lates_formatted}"
+                }
+            }
+            shopper_widgets.append(widget)
 
     sections = [{"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": summary_text}}]}]
     if shoppers:
