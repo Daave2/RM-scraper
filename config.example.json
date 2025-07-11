@@ -1,0 +1,21 @@
+{
+    "debug": false,
+    "login_url": "https://sellercentral.amazon.co.uk/ap/signin",
+    "login_email": "you@example.com",
+    "login_password": "your_password",
+    "otp_secret_key": "OTP_SECRET",
+    "chat_webhook_url": "https://chat.googleapis.com/...",
+    "summary_chat_webhook_url": "https://chat.googleapis.com/...",
+    "target_stores": [
+      {
+        "merchant_id": "AMAZON_MERCHANT_ID_1",
+        "marketplace_id": "YOUR_MARKETPLACE_ID_1",
+        "store_name": "Morrisons - Example Store 1"
+      },
+      {
+        "merchant_id": "AMAZON_MERCHANT_ID_2",
+        "marketplace_id": "YOUR_MARKETPLACE_ID_2",
+        "store_name": "Morrisons - Example Store 2"
+      }
+    ]
+  }

@@ -1,0 +1,18 @@
+# Local configuration files
+config.json
+state.json
+
+# Python virtual environment
+venv/
+*/venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Output & Log files
+output/
+app.log*
+
+# OS-specific files
+.DS_Store
