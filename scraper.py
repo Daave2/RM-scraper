@@ -2,7 +2,7 @@
 #         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
 # - Scrapes all stores first, then sends all notifications in a batch.
-# - Includes highly robust login logic that no longer guesses the landing page.
+# - Includes highly robust "Assume and Verify" login logic.
 # - Posts a detailed, combined report for each store to a chat webhook.
 # - Posts a final aggregate summary for all stores.
 # =======================================================================================
@@ -145,11 +145,9 @@ async def perform_login(page: Page) -> bool:
         await page.get_by_label("Continue").click()
         await page.get_by_label("Password").fill(config['login_password'])
         
-        # After clicking sign-in, wait for either the OTP page or the next page to load
         async with page.expect_navigation(wait_until="domcontentloaded", timeout=WAIT_TIMEOUT):
             await page.get_by_label("Sign in").click()
 
-        # If OTP page appears, handle it.
         if "mfa" in page.url:
             app_logger.info("OTP challenge detected.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
@@ -157,13 +155,11 @@ async def perform_login(page: Page) -> bool:
             async with page.expect_navigation(wait_until="load", timeout=WAIT_TIMEOUT):
                 await page.get_by_role("button", name="Sign in").click()
         
-        # At this point, we assume login is successful, regardless of the landing page.
-        # The prime_master_session function will verify this.
-        app_logger.info("Login flow completed. Session will be verified.")
+        app_logger.info("Login flow actions completed. Session will be verified.")
         return True
 
     except Exception as e:
-        app_logger.critical(f"Login failed: {e}", exc_info=DEBUG_MODE)
+        app_logger.critical(f"Login failed during actions: {e}", exc_info=DEBUG_MODE)
         await _save_screenshot(page, "login_failure")
         return False
 
@@ -186,6 +182,10 @@ async def prime_master_session() -> bool:
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
         return True
+    except Exception as e:
+        app_logger.critical(f"Session verification failed after login actions: {e}", exc_info=DEBUG_MODE)
+        await _save_screenshot(page, "session_verification_failure")
+        return False
     finally:
         await ctx.close()
 
@@ -426,8 +426,10 @@ async def main():
         
         if all_results:
             app_logger.info(f"Scraping complete. Sending {len(all_results)} store reports...")
-            tasks = [post_store_report(result) for result in all_results]
-            await asyncio.gather(*tasks)
+            for result in all_results:
+                await post_store_report(result)
+                app_logger.info(f"Waiting {WEBHOOK_DELAY_SECONDS}s before next webhook post...")
+                await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
             
             app_logger.info("Sending aggregate summary report...")
             await post_aggregate_summary(all_results)
