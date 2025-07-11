@@ -172,7 +172,6 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
         
-        # This is the "verification" step. If login wasn't truly successful, this will fail.
         app_logger.info("Verifying and finalizing session by visiting the first store's dashboard.")
         first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
         await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
@@ -183,7 +182,7 @@ async def prime_master_session() -> bool:
         app_logger.info("Saved new session state.")
         return True
     except Exception as e:
-        app_logger.critical(f"Session verification failed after login actions: {e}", exc_info=DEBUG_MODE)
+        app_logger.critical(f"Session verification failed after login actions: {e}", exc_info=True)
         await _save_screenshot(page, "session_verification_failure")
         return False
     finally:
