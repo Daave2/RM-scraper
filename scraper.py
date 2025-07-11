@@ -90,9 +90,39 @@ PAGE_TIMEOUT       = 90_000
 ACTION_TIMEOUT     = 45_000
 WAIT_TIMEOUT       = 45_000
 
+# Retry configuration for scraping functions
+SCRAPE_RETRY_ATTEMPTS = 3
+SCRAPE_RETRY_DELAY    = 5  # seconds
+
 playwright = None
 browser    = None
 log_lock   = asyncio.Lock()
+
+
+async def run_with_retries(func, *args, max_attempts=SCRAPE_RETRY_ATTEMPTS,
+                           attempt_delay=SCRAPE_RETRY_DELAY, **kwargs):
+    """Run an async function with retry logic.
+
+    Retries when the function raises an exception or returns ``None``.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = await func(*args, **kwargs)
+            if result is not None:
+                return result
+            raise ValueError("result was None")
+        except Exception as e:
+            if attempt == max_attempts:
+                app_logger.error(
+                    f"{func.__name__} failed after {max_attempts} attempts: {e}"
+                )
+                return None
+            app_logger.warning(
+                f"{func.__name__} attempt {attempt} failed: {e}. "
+                f"Retrying in {attempt_delay}s..."
+            )
+            await asyncio.sleep(attempt_delay)
+
 
 
 # =======================================================================================
@@ -420,8 +450,12 @@ async def main():
                 ctx = await browser.new_context(storage_state=storage_state)
                 page = await ctx.new_page()
                 
-                metrics_data = await scrape_store_metrics(page, store_info)
-                inf_items = await scrape_inf_data(page, store_info)
+                metrics_data = await run_with_retries(
+                    scrape_store_metrics, page, store_info
+                )
+                inf_items = await run_with_retries(
+                    scrape_inf_data, page, store_info
+                )
 
                 if metrics_data:
                     combined_data = {**metrics_data, "inf_items": inf_items if inf_items is not None else []}
