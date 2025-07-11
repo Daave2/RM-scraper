@@ -1,9 +1,10 @@
 # =======================================================================================
-#         AMAZON SELLER CENTRAL SCRAPER (MULTI-STORE VERSION)
+#         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
-# - Handles multiple stores from a list in the configuration.
-# - Posts individual store reports and a final aggregate summary to webhooks.
-# - Uses robust session management to log in only when necessary.
+# - Scrapes all stores first, then sends all notifications in a batch.
+# - Simplified INF scraping to be faster and more reliable.
+# - Posts a detailed, combined report for each store to a chat webhook.
+# - Posts a final aggregate summary for all stores.
 # =======================================================================================
 
 import logging
@@ -66,25 +67,28 @@ CHAT_WEBHOOK_URL         = config.get('chat_webhook_url')
 SUMMARY_CHAT_WEBHOOK_URL = config.get('summary_chat_webhook_url')
 TARGET_STORES            = config.get('target_stores', []) 
 
-# --- Emojis and Colors for Chat ---
-EMOJI_GREEN_CHECK = "\u2705"  # ✅
-EMOJI_RED_CROSS   = "\u274C"  # ❌
+# --- Thresholds & Formatting ---
+EMOJI_GREEN_CHECK = "\u2705"
+EMOJI_RED_CROSS   = "\u274C"
 COLOR_GOOD        = "#2E8B57" 
 COLOR_BAD         = "#CD5C5C"
-
 UPH_THRESHOLD    = 80
 LATES_THRESHOLD = 3.0
 INF_THRESHOLD   = 2.0
 
+# --- INF Scraper Specific Constants ---
+SMALL_IMAGE_SIZE    = 300
+QR_CODE_SIZE        = 60
+WEBHOOK_DELAY_SECONDS = 1.0 # Delay between sending webhook messages to avoid rate limiting
+
+# --- File Paths & Timeouts ---
 JSON_LOG_FILE = os.path.join('output', 'submissions.jsonl')
 STORAGE_STATE  = 'state.json'
 OUTPUT_DIR     = 'output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 PAGE_TIMEOUT       = 90_000
 ACTION_TIMEOUT     = 45_000
 WAIT_TIMEOUT       = 45_000
-WORKER_RETRY_COUNT = 3
 
 playwright = None
 browser    = None
@@ -94,26 +98,19 @@ log_lock   = asyncio.Lock()
 # =======================================================================================
 #    AUTHENTICATION & SESSION MANAGEMENT
 # =======================================================================================
-
 async def _save_screenshot(page: Page | None, prefix: str):
-    if not page or page.is_closed():
-        return
+    if not page or page.is_closed(): return
     try:
-        path = os.path.join(
-            OUTPUT_DIR,
-            f"{prefix}_{datetime.now(LOCAL_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.png"
-        )
+        path = os.path.join(OUTPUT_DIR, f"{prefix}_{datetime.now(LOCAL_TIMEZONE).strftime('%Y%m%d_%H%M%S')}.png")
         await page.screenshot(path=path, full_page=True, timeout=15000)
         app_logger.info(f"Screenshot saved: {path}")
     except Exception as e:
         app_logger.error(f"Screenshot error: {e}")
 
 def ensure_storage_state() -> bool:
-    if not os.path.exists(STORAGE_STATE) or os.path.getsize(STORAGE_STATE) == 0:
-        return False
+    if not os.path.exists(STORAGE_STATE) or os.path.getsize(STORAGE_STATE) == 0: return False
     try:
-        with open(STORAGE_STATE, 'r') as f:
-            data = json.load(f)
+        with open(STORAGE_STATE, 'r') as f: data = json.load(f)
         return isinstance(data, dict) and data.get("cookies")
     except (json.JSONDecodeError, IOError):
         return False
@@ -124,7 +121,7 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        await expect(page.locator("#range-selector")).to_be_visible(timeout=WAIT_TIMEOUT)
+        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Existing session still valid.")
         return False
     except Exception:
@@ -135,49 +132,36 @@ async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
         await page.goto(LOGIN_URL, timeout=PAGE_TIMEOUT, wait_until="load")
-
         email_input = page.get_by_label("Email or mobile phone number")
         await expect(email_input).to_be_visible(timeout=WAIT_TIMEOUT)
         await email_input.fill(config['login_email'])
-        
         await page.get_by_label("Continue").click()
-
+        
         password_selector = 'input#ap_password'
         continue_shopping_selector = 'button:has-text("Continue shopping")'
-        
-        app_logger.info("Waiting for next step: password field or 'Continue shopping' interstitial...")
-        await page.wait_for_selector(
-            f"{password_selector}, {continue_shopping_selector}", 
-            timeout=WAIT_TIMEOUT
-        )
-
+        await page.wait_for_selector(f"{password_selector}, {continue_shopping_selector}", timeout=WAIT_TIMEOUT)
         if await page.locator(continue_shopping_selector).is_visible():
-            app_logger.info("Interstitial page detected. Clicking 'Continue shopping'.")
             await page.locator(continue_shopping_selector).click()
-
+        
         pw_input = page.get_by_label("Password")
         await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
         await pw_input.fill(config['login_password'])
-
         await page.get_by_label("Sign in").click()
 
         otp_sel  = 'input[id*="otp"]'
         dash_sel = "#content"
         acct_sel = 'h1:has-text("Select an account")'
         await page.wait_for_selector(f"{otp_sel}, {dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
-
         if await page.locator(otp_sel).is_visible():
-            app_logger.info("OTP challenge detected. Entering code.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
             await page.locator(otp_sel).fill(code)
             await page.get_by_role("button", name="Sign in").click()
             await page.wait_for_selector(f"{dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
         
         if await page.locator(acct_sel).is_visible():
-            app_logger.error("Account-picker page was displayed after login. The script cannot proceed.")
+            app_logger.error("Account-picker page was displayed. This should be handled by direct navigation.")
             await _save_screenshot(page, "login_account_picker")
-            return False
-
+        
         await expect(page.locator(dash_sel)).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Login successful.")
         return True
@@ -191,142 +175,138 @@ async def prime_master_session() -> bool:
     app_logger.info("Priming master session")
     ctx = await browser.new_context()
     try:
-        page = await ctx.new_page()
-        if not await perform_login(page):
-            return False
+        if not await perform_login(await ctx.new_page()): return False
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
         return True
     finally:
         await ctx.close()
 
-
 # =======================================================================================
-#                       UTILITIES & CORE SCRAPING LOGIC
+#                       CORE SCRAPING LOGIC
 # =======================================================================================
-
 def _format_metric_with_emoji(value_str: str, threshold: float, is_uph: bool = False) -> str:
     try:
         numeric_value = float(re.sub(r'[^\d.]', '', value_str))
         is_good = (numeric_value >= threshold) if is_uph else (numeric_value <= threshold)
-        emoji = EMOJI_GREEN_CHECK if is_good else EMOJI_RED_CROSS
-        return f"{value_str} {emoji}"
-    except (ValueError, TypeError):
-        return value_str
+        return f"{value_str} {EMOJI_GREEN_CHECK if is_good else EMOJI_RED_CROSS}"
+    except (ValueError, TypeError): return value_str
         
 def _format_metric_with_color(value_str: str, threshold: float, is_uph: bool = False) -> str:
     try:
         numeric_value = float(re.sub(r'[^\d.]', '', value_str))
         is_good = (numeric_value >= threshold) if is_uph else (numeric_value <= threshold)
-        color = COLOR_GOOD if is_good else COLOR_BAD
-        return f'<font color="{color}">{value_str}</font>'
-    except (ValueError, TypeError):
-        return value_str
+        return f'<font color="{COLOR_GOOD if is_good else COLOR_BAD}">{value_str}</font>'
+    except (ValueError, TypeError): return value_str
 
-async def log_results(data: dict):
-    async with log_lock:
-        log_entry = {'timestamp': datetime.now(LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S'), **data}
-        try:
-            async with aiofiles.open(JSON_LOG_FILE, 'a', encoding='utf-8') as f:
-                await f.write(json.dumps(log_entry) + '\n')
-        except IOError as e:
-            app_logger.error(f"Error writing to JSON log file {JSON_LOG_FILE}: {e}")
-
-async def scrape_store_data(browser: Browser, store_info: dict, storage_state: dict) -> dict | None:
+async def scrape_store_metrics(page: Page, store_info: dict) -> dict | None:
     store_name = store_info['store_name']
-    app_logger.info(f"Starting detailed data collection for '{store_name}'")
+    app_logger.info(f"Starting METRICS data collection for '{store_name}'")
+    try:
+        dash_url = (f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={store_info['merchant_id']}&mons_sel_mkid={store_info['marketplace_id']}")
+        await page.goto(dash_url, timeout=PAGE_TIMEOUT)
+        refresh_button = page.get_by_role("button", name="Refresh")
+        await expect(refresh_button).to_be_visible(timeout=WAIT_TIMEOUT)
+        customised_tab = page.locator("#content span:has-text('Customised')").nth(0)
+        await customised_tab.click(timeout=ACTION_TIMEOUT)
+        date_picker = page.locator("kat-date-range-picker")
+        await expect(date_picker).to_be_visible(timeout=WAIT_TIMEOUT)
+        now = datetime.now(LOCAL_TIMEZONE).strftime("%m/%d/%Y")
+        date_inputs = date_picker.locator('input[type="text"]')
+        await date_inputs.nth(0).fill(now); await date_inputs.nth(1).fill(now)
+        apply_btn = page.get_by_role("button", name="Apply")
+        async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=30000):
+            await apply_btn.click(timeout=ACTION_TIMEOUT)
+        async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=40000) as refresh_info:
+            await refresh_button.click(timeout=ACTION_TIMEOUT)
+        api_data = await (await refresh_info.value).json()
+        app_logger.info(f"Received METRICS API response for {store_name}.")
+        
+        shopper_stats, store_totals = [], {'units':0, 'time':0, 'orders':0, 'req_units':0, 'inf_items':0, 'lates':0}
+        for entry in api_data:
+            m = entry.get("metrics", {}); name = entry.get("shopperName")
+            if entry.get("type") == "MASTER" and name and name != "SHOPPER_NAME_NOT_FOUND":
+                orders = m.get("OrdersShopped_V2", 0)
+                if orders == 0: continue
+                units = m.get("PickedUnits_V2", 0); time_sec = m.get("PickTimeInSec_V2", 0)
+                shopper_stats.append({"name":name, "uph":f"{(units / (time_sec / 3600)) if time_sec > 0 else 0:.0f}", "inf":f"{m.get('ItemNotFoundRate_V2',0):.1f} %", "lates":f"{m.get('LatePicksRate',0):.1f} %", "orders":int(orders)})
+                store_totals['units'] += units; store_totals['time'] += time_sec; store_totals['orders'] += orders
+                req_units = m.get("RequestedQuantity_V2", 0); store_totals['req_units'] += req_units
+                store_totals['inf_items'] += req_units * (m.get("ItemNotFoundRate_V2", 0) / 100.0)
+                store_totals['lates'] += orders * (m.get("LatePicksRate", 0) / 100.0)
+        
+        if not shopper_stats:
+            app_logger.warning(f"No active shoppers found for {store_name}.")
+            return {"overall": {'store': store_name}, "shoppers": []}
+        
+        overall_uph = (store_totals['units']/(store_totals['time']/3600)) if store_totals['time']>0 else 0
+        overall_inf = (store_totals['inf_items']/store_totals['req_units'])*100 if store_totals['req_units']>0 else 0
+        overall_lates = (store_totals['lates']/store_totals['orders'])*100 if store_totals['orders']>0 else 0
+        overall = {'store':store_name, 'orders':str(int(store_totals['orders'])), 'units':str(int(store_totals['units'])), 'uph':f"{overall_uph:.0f}", 'inf':f"{overall_inf:.1f} %", 'lates':f"{overall_lates:.1f} %"}
+        shoppers = sorted(shopper_stats, key=lambda x: float(x["inf"].replace("%","").strip()))
+        return {"overall": overall, "shoppers": shoppers}
+    except Exception as e:
+        app_logger.error(f"Error scraping metrics for {store_name}: {e}", exc_info=True)
+        await _save_screenshot(page, f"{store_name}_metrics_error")
+        return None
 
-    for attempt in range(WORKER_RETRY_COUNT):
-        ctx: BrowserContext = None
+async def scrape_inf_data(page: Page, store_info: dict) -> list[dict] | None:
+    store_name = store_info["store_name"]
+    app_logger.info(f"Starting INF data collection for '{store_name}'")
+    try:
+        url = "https://sellercentral.amazon.co.uk/snow-inventory/inventoryinsights/ref=xx_infr_dnav_xx"
+        await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+        await expect(page.locator("#range-selector")).to_be_visible(timeout=WAIT_TIMEOUT)
+        
+        table_sel = "table.imp-table tbody"
         try:
-            ctx = await browser.new_context(storage_state=storage_state)
-            page = await ctx.new_page()
+            await expect(page.locator(f"{table_sel} tr").first).to_be_visible(timeout=20000)
+        except TimeoutError:
+            app_logger.info(f"No INF data rows found for '{store_name}'; returning empty list.")
+            return []
+        
+        first_row_before_sort = await page.locator(f"{table_sel} tr").first.text_content()
 
-            dash_url = (
-                f"https://sellercentral.amazon.co.uk/snowdash"
-                f"?mons_sel_dir_mcid={store_info['merchant_id']}"
-                f"&mons_sel_mkid={store_info['marketplace_id']}"
+        app_logger.info(f"Sorting table by 'INF Units' for '{store_name}'")
+        await page.locator("#sort-3").click()
+
+        try:
+            await page.wait_for_function(
+                expression="""(args) => {
+                    const [selector, initialText] = args;
+                    const firstRow = document.querySelector(selector);
+                    return firstRow && firstRow.textContent !== initialText;
+                }""",
+                arg=[f"{table_sel} tr", first_row_before_sort],
+                timeout=20000
             )
-            await page.goto(dash_url, timeout=PAGE_TIMEOUT)
+            app_logger.info("Table sort confirmed by DOM change.")
+        except TimeoutError:
+            app_logger.warning("Table content did not change after sort click. Proceeding with current data (might be pre-sorted or single-page).")
 
-            refresh_button = page.get_by_role("button", name="Refresh")
-            await expect(refresh_button).to_be_visible(timeout=WAIT_TIMEOUT)
+        rows = await page.locator(f"{table_sel} tr").all()
+        items = []
+        for r in rows[:5]:
+            cells = r.locator("td")
+            thumb = await cells.nth(0).locator("img").get_attribute("src") or ""
+            items.append({
+                "image_url": re.sub(r"\._SS\d+_\.", f"._SS{SMALL_IMAGE_SIZE}_.", thumb),
+                "sku": await cells.nth(1).locator("span").inner_text(),
+                "product_name": await cells.nth(2).locator("a span").inner_text(),
+                "inf_units": await cells.nth(3).locator("span").inner_text(),
+                "orders_impacted": await cells.nth(4).locator("span").inner_text(),
+                "inf_pct": await cells.nth(8).locator("span").inner_text(),
+            })
+        app_logger.info(f"Scraped top {len(items)} INF items for '{store_name}'")
+        return items
+    except Exception as e:
+        app_logger.error(f"Error scraping INF data for {store_name}: {e}", exc_info=True)
+        await _save_screenshot(page, f"{store_name}_inf_error")
+        return None
 
-            customised_tab = page.locator("#content span:has-text('Customised')").nth(0)
-            await customised_tab.click(timeout=ACTION_TIMEOUT)
-            
-            date_picker = page.locator("kat-date-range-picker")
-            await expect(date_picker).to_be_visible(timeout=WAIT_TIMEOUT)
-            
-            now = datetime.now(LOCAL_TIMEZONE).strftime("%m/%d/%Y")
-            date_inputs = date_picker.locator('input[type="text"]')
-            await date_inputs.nth(0).fill(now)
-            await date_inputs.nth(1).fill(now)
-
-            apply_btn = page.get_by_role("button", name="Apply")
-            async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=30000):
-                await apply_btn.click(timeout=ACTION_TIMEOUT)
-
-            async with page.expect_response(lambda r: "/api/metrics" in r.url, timeout=40000) as refresh_info:
-                await refresh_button.click(timeout=ACTION_TIMEOUT)
-            api_data = await (await refresh_info.value).json()
-            app_logger.info(f"Received /api/metrics response for {store_name}.")
-            
-            shopper_stats = []
-            store_total_units_picked = store_total_pick_time_sec = store_total_orders = 0
-            store_total_requested_units = store_total_items_not_found = store_total_weighted_lates = 0
-
-            for entry in api_data:
-                metrics = entry.get("metrics", {})
-                shopper_name = entry.get("shopperName")
-                if entry.get("type") == "MASTER" and shopper_name and shopper_name != "SHOPPER_NAME_NOT_FOUND":
-                    orders = metrics.get("OrdersShopped_V2", 0)
-                    if orders == 0: continue
-                    
-                    units = metrics.get("PickedUnits_V2", 0)
-                    pick_time_sec = metrics.get("PickTimeInSec_V2", 0)
-                    uph = (units / (pick_time_sec / 3600)) if pick_time_sec > 0 else 0.0
-                    shopper_stats.append({
-                        "name": shopper_name, "uph": f"{uph:.0f}",
-                        "inf": f"{metrics.get('ItemNotFoundRate_V2', 0.0):.1f} %",
-                        "lates": f"{metrics.get('LatePicksRate', 0.0):.1f} %", "orders": int(orders),
-                    })
-                    store_total_units_picked += units
-                    store_total_pick_time_sec += pick_time_sec
-                    store_total_orders += orders
-                    req_units = metrics.get("RequestedQuantity_V2", 0)
-                    inf_rate = metrics.get("ItemNotFoundRate_V2", 0.0) / 100.0
-                    store_total_requested_units += req_units
-                    store_total_items_not_found += req_units * inf_rate
-                    lates_rate = metrics.get("LatePicksRate", 0.0) / 100.0
-                    store_total_weighted_lates += lates_rate * orders
-
-            if not shopper_stats:
-                app_logger.warning(f"No active shoppers found for {store_name}.")
-                return {"overall": {'store': store_name}, "shoppers": []}
-
-            overall_uph = (store_total_units_picked / (store_total_pick_time_sec / 3600)) if store_total_pick_time_sec > 0 else 0
-            overall_inf = (store_total_items_not_found / store_total_requested_units) * 100 if store_total_requested_units > 0 else 0
-            overall_lates = (store_total_weighted_lates / store_total_orders) * 100 if store_total_orders > 0 else 0
-
-            overall_metrics = {
-                'store': store_name, 'orders': str(int(store_total_orders)),
-                'units': str(int(store_total_units_picked)), 'uph': f"{overall_uph:.0f}",
-                'inf': f"{overall_inf:.1f} %", 'lates': f"{overall_lates:.1f} %"
-            }
-            sorted_shoppers = sorted(shopper_stats, key=lambda x: float(x["inf"].replace("%", "").strip()))
-            app_logger.info(f"Aggregated data for {len(sorted_shoppers)} shoppers in {store_name}.")
-            return {"overall": overall_metrics, "shoppers": sorted_shoppers}
-        except Exception as e:
-            app_logger.warning(f"Attempt {attempt+1} failed for {store_name}: {e}", exc_info=True)
-            if attempt == WORKER_RETRY_COUNT - 1:
-                page_to_screenshot = next(iter(ctx.pages), None) if ctx else None
-                await _save_screenshot(page_to_screenshot, f"{store_name}_error")
-        finally:
-            if ctx: await ctx.close()
-    app_logger.error(f"All attempts failed for {store_name}.")
-    return None
-
+# =======================================================================================
+#                       NOTIFICATIONS
+# =======================================================================================
 async def post_to_webhook(url: str, payload: dict, store_name: str, hook_type: str):
     if not url: return
     try:
@@ -343,114 +323,123 @@ async def post_to_webhook(url: str, payload: dict, store_name: str, hook_type: s
         app_logger.error(f"Error posting to {hook_type} webhook for {store_name}: {e}", exc_info=True)
 
 async def post_store_report(data: dict):
-    overall, shoppers = data.get("overall"), data.get("shoppers")
+    overall, shoppers, inf_items = data.get("overall",{}), data.get("shoppers",[]), data.get("inf_items", [])
     full_store_name = overall.get("store", "Unknown Store")
     timestamp = datetime.now(LOCAL_TIMEZONE).strftime("%A %d %B, %H:%M")
-    
     short_store_name = full_store_name.split(' - ')[-1] if ' - ' in full_store_name else full_store_name
     
-    if not shoppers:
-        summary_text = "No active shoppers found for this period."
-        shopper_widgets = []
-    else:
+    sections = []
+    # Section 1: Overall Metrics
+    if shoppers:
         summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(overall.get('uph'), UPH_THRESHOLD, is_uph=True)}<br>"
                         f"• <b>Lates:</b> {_format_metric_with_emoji(overall.get('lates'), LATES_THRESHOLD)}<br>"
                         f"• <b>INF:</b> {_format_metric_with_emoji(overall.get('inf'), INF_THRESHOLD)}<br>"
                         f"• <b>Orders:</b> {overall.get('orders')}")
-        
+        sections.append({"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": summary_text}}]})
+    else:
+        sections.append({"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": "No active shoppers found for this period."}}]})
+
+    # Section 2: Shopper Breakdown
+    if shoppers:
         shopper_widgets = []
         for s in shoppers:
-            uph_formatted = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True)
-            inf_formatted = _format_metric_with_color(f"<b>INF:</b> {s['inf']}", INF_THRESHOLD)
-            lates_formatted = _format_metric_with_color(f"<b>Lates:</b> {s['lates']}", LATES_THRESHOLD)
-            
-            widget = {
-                "decoratedText": {
-                    "icon": {"knownIcon": "PERSON"},
-                    "topLabel": f"<b>{s['name']}</b> ({s['orders']} Orders)",
-                    "text": f"{uph_formatted} | {inf_formatted} | {lates_formatted}"
-                }
-            }
-            shopper_widgets.append(widget)
+            uph = _format_metric_with_color(f"<b>UPH:</b> {s['uph']}", UPH_THRESHOLD, True)
+            inf = _format_metric_with_color(f"<b>INF:</b> {s['inf']}", INF_THRESHOLD)
+            lates = _format_metric_with_color(f"<b>Lates:</b> {s['lates']}", LATES_THRESHOLD)
+            shopper_widgets.append({"decoratedText": {"icon":{"knownIcon":"PERSON"}, "topLabel":f"<b>{s['name']}</b> ({s['orders']} Orders)", "text":f"{uph} | {inf} | {lates}"}})
+        sections.append({"header":f"Per-Shopper Breakdown ({len(shoppers)})", "collapsible":True, "widgets":shopper_widgets})
 
-    sections = [{"header": "Store-Wide Performance", "widgets": [{"textParagraph": {"text": summary_text}}]}]
-    if shoppers:
-        sections.append({"header": f"Per-Shopper Breakdown ({len(shoppers)})", "collapsible": True, "widgets": shopper_widgets})
+    # Section 3: Top 5 INF Items
+    if inf_items:
+        inf_widgets = [{"divider": {}}]
+        for it in inf_items:
+            code = urllib.parse.quote(it["sku"])
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size={QR_CODE_SIZE}x{QR_CODE_SIZE}&data={code}"
+            left_col = {"horizontalSizeStyle":"FILL_MINIMUM_SPACE", "horizontalAlignment":"CENTER", "verticalAlignment":"CENTER", "widgets":[{"image":{"imageUrl":qr_url, "altText":f"QR {it['sku']}"}}]}
+            right_col = {"horizontalSizeStyle":"FILL_AVAILABLE_SPACE", "widgets":[
+                {"textParagraph":{"text":f"<b>{it['product_name']}</b><br><b>SKU:</b> {it['sku']}<br><b>INF Units:</b> {it['inf_units']} ({it['inf_pct']}) | <b>Orders:</b> {it['orders_impacted']}"}},
+                {"image":{"imageUrl":it["image_url"], "altText":it["product_name"]}}
+            ]}
+            inf_widgets.extend([{"columns": {"columnItems": [left_col, right_col]}}, {"divider": {}}])
+        sections.append({"header": f"Top {len(inf_items)} INF Items", "collapsible": True, "uncollapsibleWidgetsCount": 1, "widgets": inf_widgets})
 
-    payload = {"cardsV2": [{"cardId": f"store-summary-{full_store_name.replace(' ', '-')}", "card": {
-        "header": {
-            "title": short_store_name,
-            "subtitle": timestamp,
-            "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
-            "imageType": "CIRCLE"
-        },
+    payload = {"cardsV2": [{"cardId": f"store-report-{full_store_name.replace(' ', '-')}", "card": {
+        "header": {"title": short_store_name, "subtitle": timestamp, "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType": "CIRCLE"},
         "sections": sections
     }}]}
     await post_to_webhook(CHAT_WEBHOOK_URL, payload, full_store_name, "per-store")
 
 #
-# *** THIS FUNCTION HAS BEEN UPDATED TO COLOR-CODE THE STORE BREAKDOWN ***
+# *** THIS FUNCTION HAS BEEN UPDATED TO PREVENT TEXT TRUNCATION ***
 #
 async def post_aggregate_summary(results: list):
-    successful_results = [r for r in results if r and r.get("shoppers")]
+    successful_results = [r for r in results if r.get("overall", {}).get("store")]
     if not SUMMARY_CHAT_WEBHOOK_URL or not successful_results: return
     
-    total_orders, total_units, fleet_pick_time_sec, fleet_weighted_lates, fleet_weighted_inf = 0, 0, 0, 0, 0
+    total_orders, total_units, fleet_pick_time_sec, fleet_weighted_lates, fleet_weighted_inf = 0,0,0,0,0
     store_widgets = []
-
-    for res in successful_results:
-        o = res["overall"]
+    for idx, res in enumerate(successful_results):
+        o = res["overall"]; inf_list = res.get("inf_items", [])
         orders, units, uph = int(o.get('orders',0)), int(o.get('units',0)), float(o.get('uph',0))
-        total_orders += orders
-        total_units += units
+        total_orders += orders; total_units += units
         if uph > 0: fleet_pick_time_sec += (units / uph) * 3600
-        fleet_weighted_lates += float(re.sub(r'[^\d.]', '', o.get('lates', '0'))) * orders
-        fleet_weighted_inf += float(re.sub(r'[^\d.]', '', o.get('inf', '0'))) * units
-
-        # Apply color formatting to each metric for the store
-        uph_formatted = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, is_uph=True)
-        lates_formatted = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD)
-        inf_formatted = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
+        fleet_weighted_lates += float(re.sub(r'[^\d.]','',o.get('lates','0'))) * orders
+        fleet_weighted_inf += float(re.sub(r'[^\d.]','',o.get('inf','0'))) * units
         
-        metrics_text = f"{uph_formatted} | {lates_formatted} | {inf_formatted}"
+        # Widget 1: The main metrics
+        uph_f = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, True)
+        lates_f = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD)
+        inf_f = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
+        metrics_text = f"{uph_f} | {lates_f} | {inf_f}"
         
-        store_widgets.append({"decoratedText": {
-            "icon": {"knownIcon": "STORE"}, 
-            "topLabel": f"<b>{o['store']}</b> ({orders} Orders)",
-            "text": metrics_text # Use the new formatted text
-        }})
+        store_widgets.append({
+            "decoratedText": {
+                "icon": {"knownIcon": "STORE"},
+                "topLabel": f"<b>{o['store']}</b> ({orders} Orders)",
+                "text": metrics_text
+            }
+        })
+        
+        # Widget 2: The Top INF item (if it exists)
+        if inf_list:
+            store_widgets.append({
+                "textParagraph": {
+                    "text": f"<i>Top INF: {inf_list[0]['product_name']}</i>"
+                }
+            })
 
-    fleet_uph = (total_units / (fleet_pick_time_sec / 3600)) if fleet_pick_time_sec > 0 else 0
-    fleet_lates = (fleet_weighted_lates / total_orders) if total_orders > 0 else 0
-    fleet_inf = (fleet_weighted_inf / total_units) if total_units > 0 else 0
-    
+        # Add a divider between store entries, but not after the last one
+        if idx < len(successful_results) - 1:
+            store_widgets.append({"divider": {}})
+
+    fleet_uph = (total_units/(fleet_pick_time_sec/3600)) if fleet_pick_time_sec > 0 else 0
+    fleet_lates = (fleet_weighted_lates/total_orders) if total_orders > 0 else 0
+    fleet_inf = (fleet_weighted_inf/total_units) if total_units > 0 else 0
     summary_text = (f"• <b>UPH:</b> {_format_metric_with_emoji(f'{fleet_uph:.0f}', UPH_THRESHOLD, True)}<br>"
                     f"• <b>Lates:</b> {_format_metric_with_emoji(f'{fleet_lates:.1f} %', LATES_THRESHOLD)}<br>"
                     f"• <b>INF:</b> {_format_metric_with_emoji(f'{fleet_inf:.1f} %', INF_THRESHOLD)}<br>"
                     f"• <b>Total Orders:</b> {total_orders}")
 
     payload = {"cardsV2": [{"cardId": "fleet-summary", "card": {
-        "header": {
-            "title": "Amazon North West Summary", 
-            "subtitle": f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores",
-            "imageUrl": "https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg",
-            "imageType": "CIRCLE"
-        },
-        "sections": [
-            {"header": "Fleet-Wide Performance (Weighted Avg)", "widgets": [{"textParagraph": {"text": summary_text}}]},
-            {
-                "header": "Per-Store Breakdown",
-                "collapsible": True,
-                "uncollapsibleWidgetsCount": len(store_widgets),
-                "widgets": store_widgets
-            }
-        ]
+        "header": {"title": "Amazon North West Summary", "subtitle":f"{datetime.now(LOCAL_TIMEZONE).strftime('%A %d %B, %H:%M')} | {len(successful_results)} stores", "imageUrl":"https://i.pinimg.com/originals/01/ca/da/01cada77a0a7d326d85b7969fe26a728.jpg", "imageType":"CIRCLE"},
+        "sections": [{"header": "Fleet-Wide Performance (Weighted Avg)", "widgets": [{"textParagraph": {"text": summary_text}}]}, {"header": "Per-Store Breakdown", "collapsible":True, "uncollapsibleWidgetsCount":len(store_widgets), "widgets":store_widgets}]
     }}]}
     await post_to_webhook(SUMMARY_CHAT_WEBHOOK_URL, payload, "Fleet", "summary")
 
+async def log_results(data: dict):
+    async with log_lock:
+        log_entry = {'timestamp':datetime.now(LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S'), **data}
+        try:
+            async with aiofiles.open(JSON_LOG_FILE, 'a', encoding='utf-8') as f:
+                await f.write(json.dumps(log_entry) + '\n')
+        except IOError as e: app_logger.error(f"Error writing to JSON log file {JSON_LOG_FILE}: {e}")
+
+# =======================================================================================
+#                       MAIN EXECUTION
+# =======================================================================================
 async def main():
     global playwright, browser
-    app_logger.info("Starting up in multi-store mode...")
+    app_logger.info("Starting up unified scraper (Metrics + INF)...")
     if not TARGET_STORES:
         app_logger.critical("`target_stores` is empty or not found in config.json. Aborting.")
         return
@@ -461,11 +450,11 @@ async def main():
         login_required = True
         if ensure_storage_state():
             app_logger.info("Found existing storage_state; verifying session.")
-            ctx = await browser.new_context(storage_state=json.load(open(STORAGE_STATE)))
+            ctx_check = await browser.new_context(storage_state=json.load(open(STORAGE_STATE)))
             test_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
-            login_required = await check_if_login_needed(await ctx.new_page(), test_url)
-            await ctx.close()
-
+            login_required = await check_if_login_needed(await ctx_check.new_page(), test_url)
+            await ctx_check.close()
+        
         if login_required:
             if not await prime_master_session():
                 app_logger.critical("Could not establish a login session. Aborting.")
@@ -474,16 +463,39 @@ async def main():
         storage_state = json.load(open(STORAGE_STATE))
         all_results = []
         for store_info in TARGET_STORES:
-            app_logger.info(f"===== Processing Store: {store_info.get('store_name', 'Unknown')} =====")
-            scraped_data = await scrape_store_data(browser, store_info, storage_state)
-            if scraped_data:
-                all_results.append(scraped_data)
-                await log_results(scraped_data)
-                await post_store_report(scraped_data)
+            store_name = store_info.get('store_name', 'Unknown')
+            app_logger.info(f"===== Processing Store: {store_name} =====")
+            ctx = None
+            try:
+                ctx = await browser.new_context(storage_state=storage_state)
+                page = await ctx.new_page()
+                
+                metrics_data = await scrape_store_metrics(page, store_info)
+                inf_items = await scrape_inf_data(page, store_info)
+
+                if metrics_data:
+                    combined_data = {**metrics_data, "inf_items": inf_items if inf_items is not None else []}
+                    all_results.append(combined_data)
+                    await log_results(combined_data)
+                else:
+                    app_logger.error(f"Failed to retrieve any metrics for {store_name}. Skipping for this store.")
+            
+            except Exception as e:
+                app_logger.error(f"An unexpected error occurred while processing {store_name}: {e}", exc_info=True)
+            finally:
+                if ctx: await ctx.close()
         
+        # After all scraping is done, send notifications
         if all_results:
+            app_logger.info(f"Scraping complete. Sending {len(all_results)} store reports...")
+            for result in all_results:
+                await post_store_report(result)
+                app_logger.info(f"Waiting {WEBHOOK_DELAY_SECONDS}s before next webhook post...")
+                await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
+            
+            app_logger.info("Sending aggregate summary report...")
             await post_aggregate_summary(all_results)
-            app_logger.info(f"Run completed. Processed {len(all_results)}/{len(TARGET_STORES)} stores.")
+            app_logger.info(f"Run completed. Processed {len(all_results)}/{len(TARGET_STORES)} stores successfully.")
         else:
             app_logger.error("Run failed: Could not retrieve data for any target stores.")
 
