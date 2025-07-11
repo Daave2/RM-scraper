@@ -116,12 +116,14 @@ def ensure_storage_state() -> bool:
         return False
 
 async def check_if_login_needed(page: Page, test_url: str) -> bool:
+    app_logger.info("Verifying session...")
     try:
         await page.goto(test_url, timeout=PAGE_TIMEOUT, wait_until="load")
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
+        # *** NEW: Universal check for any logged-in page ***
+        await expect(page.locator('a[href*="https://sellercentral.amazon.co.uk/help"]')).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Existing session still valid.")
         return False
     except Exception:
@@ -172,10 +174,9 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
         
-        app_logger.info("Verifying and finalizing session by visiting the first store's dashboard.")
-        first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
-        await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
-        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
+        # *** NEW: Universal Verification Step ***
+        app_logger.info("Verifying session by checking for universal navigation elements.")
+        await expect(page.locator('a[href*="https://sellercentral.amazon.co.uk/help"]')).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Session successfully verified.")
 
         await ctx.storage_state(path=STORAGE_STATE)
