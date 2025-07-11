@@ -2,7 +2,7 @@
 #         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
 # - Scrapes all stores first, then sends all notifications in a batch.
-# - Includes highly robust login logic to handle multiple landing pages.
+# - Includes highly robust login logic that no longer guesses the landing page.
 # - Posts a detailed, combined report for each store to a chat webhook.
 # - Posts a final aggregate summary for all stores.
 # =======================================================================================
@@ -96,7 +96,7 @@ log_lock   = asyncio.Lock()
 
 
 # =======================================================================================
-#    AUTHENTICATION & SESSION MANAGEMENT (UPGRADED LOGIC)
+#    AUTHENTICATION & SESSION MANAGEMENT (ULTIMATE LOGIC)
 # =======================================================================================
 async def _save_screenshot(page: Page | None, prefix: str):
     if not page or page.is_closed(): return
@@ -138,47 +138,28 @@ async def perform_login(page: Page) -> bool:
         continue_input = 'input[type="submit"][aria-labelledby="continue-announce"]'
         await page.wait_for_selector(f"{email_sel}, {continue_btn}, {continue_input}", timeout=WAIT_TIMEOUT)
 
-        if await page.locator(continue_btn).is_visible():
-            await page.locator(continue_btn).click()
-        elif await page.locator(continue_input).is_visible():
-            await page.locator(continue_input).click()
+        if await page.locator(continue_btn).is_visible(): await page.locator(continue_btn).click()
+        elif await page.locator(continue_input).is_visible(): await page.locator(continue_input).click()
         
         await page.get_by_label("Email or mobile phone number").fill(config['login_email'])
         await page.get_by_label("Continue").click()
         await page.get_by_label("Password").fill(config['login_password'])
-        await page.get_by_label("Sign in").click()
-
-        otp_sel = 'input[id*="otp"]'
-        # *** NEW LOGIC: Define all possible successful post-login pages ***
-        acct_sel = 'h1:has-text("Select an account")'
-        metrics_dash_sel = '#dashboard-title-component-id'
-        inf_dash_sel = '#range-selector'
-        shopper_perf_sel = 'h1:has-text("Shopper Performance")'
         
-        possible_landing_pages = f"{otp_sel}, {acct_sel}, {metrics_dash_sel}, {inf_dash_sel}, {shopper_perf_sel}"
-        await page.wait_for_selector(possible_landing_pages, timeout=WAIT_TIMEOUT)
+        # After clicking sign-in, wait for either the OTP page or the next page to load
+        async with page.expect_navigation(wait_until="domcontentloaded", timeout=WAIT_TIMEOUT):
+            await page.get_by_label("Sign in").click()
 
-        if await page.locator(otp_sel).is_visible():
+        # If OTP page appears, handle it.
+        if "mfa" in page.url:
             app_logger.info("OTP challenge detected.")
             code = pyotp.TOTP(config['otp_secret_key']).now()
-            await page.locator(otp_sel).fill(code)
-            await page.get_by_role("button", name="Sign in").click()
-            await page.wait_for_selector(possible_landing_pages.replace(f"{otp_sel}, ", ""), timeout=WAIT_TIMEOUT)
+            await page.locator('input[id*="otp"]').fill(code)
+            async with page.expect_navigation(wait_until="load", timeout=WAIT_TIMEOUT):
+                await page.get_by_role("button", name="Sign in").click()
         
-        if await page.locator(acct_sel).is_visible():
-            app_logger.warning("Landed on Account-picker page. Login successful.")
-        elif await page.locator(shopper_perf_sel).is_visible():
-            app_logger.warning("Landed on Shopper Performance page. Login successful.")
-        elif await page.locator(metrics_dash_sel).is_visible():
-             app_logger.info("Landed on Metrics dashboard. Login successful.")
-        elif await page.locator(inf_dash_sel).is_visible():
-             app_logger.info("Landed on INF dashboard. Login successful.")
-        else:
-            # This case should ideally not be reached if the selectors are correct
-            app_logger.error("Landed on an unrecognized page after login.")
-            raise TimeoutError("Could not confirm a successful login state.")
-
-        app_logger.info("Login flow completed successfully.")
+        # At this point, we assume login is successful, regardless of the landing page.
+        # The prime_master_session function will verify this.
+        app_logger.info("Login flow completed. Session will be verified.")
         return True
 
     except Exception as e:
@@ -195,10 +176,12 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
         
-        app_logger.info("Finalizing session by visiting the first store's metrics dashboard.")
+        # This is the "verification" step. If login wasn't truly successful, this will fail.
+        app_logger.info("Verifying and finalizing session by visiting the first store's dashboard.")
         first_store_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={TARGET_STORES[0]['merchant_id']}&mons_sel_mkid={TARGET_STORES[0]['marketplace_id']}"
         await page.goto(first_store_url, timeout=PAGE_TIMEOUT, wait_until="load")
         await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
+        app_logger.info("Session successfully verified.")
 
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
@@ -443,10 +426,8 @@ async def main():
         
         if all_results:
             app_logger.info(f"Scraping complete. Sending {len(all_results)} store reports...")
-            for result in all_results:
-                await post_store_report(result)
-                app_logger.info(f"Waiting {WEBHOOK_DELAY_SECONDS}s before next webhook post...")
-                await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
+            tasks = [post_store_report(result) for result in all_results]
+            await asyncio.gather(*tasks)
             
             app_logger.info("Sending aggregate summary report...")
             await post_aggregate_summary(all_results)
