@@ -2,7 +2,7 @@
 #         AMAZON SELLER CENTRAL SCRAPER (METRICS + TOP 5 INF ITEMS)
 # =======================================================================================
 # - Scrapes all stores first, then sends all notifications in a batch.
-# - Includes highly robust "Assume and Verify" login logic proposed by the user.
+# - Includes highly robust "Assume and Verify" login logic using a trusted element.
 # - Posts a detailed, combined report for each store to a chat webhook.
 # - Posts a final aggregate summary for all stores.
 # =======================================================================================
@@ -121,8 +121,9 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
-        app_logger.info("Existing session still valid.")
+        # *** NEW: Use the trusted table element as the definitive check ***
+        await expect(page.locator("kat-table >> nth=0")).to_be_visible(timeout=WAIT_TIMEOUT)
+        app_logger.info("Existing session still valid (metrics table found).")
         return False
     except Exception as e:
         app_logger.warning(f"Verification check failed: {e}. Assuming login is required.")
@@ -172,34 +173,32 @@ async def prime_master_session() -> bool:
         if not await perform_login(page):
             return False
 
-        first = TARGET_STORES[0]
-        dash_url = f"https://sellercentral.amazon.co.uk/snowdash?mons_sel_dir_mcid={first['merchant_id']}&mons_sel_mkid={first['marketplace_id']}"
-        app_logger.info(f"Verifying session by navigating to dashboard -> {dash_url}")
-        await page.goto(dash_url, timeout=PAGE_TIMEOUT, wait_until="load")
-
-        url_ok = "snowdash" in page.url.lower()
-        sel_ok = False
-        try:
-            # Use is_visible() with a short timeout; it returns True/False instead of raising an error.
-            sel_ok = await page.locator("#dashboard-title-component-id").is_visible(timeout=5000)
-        except Exception:
-            app_logger.warning("Selector for dashboard title not found, relying on URL.")
-
-        if not (url_ok or sel_ok):
-            app_logger.critical("Session verification failed: could not confirm presence on a valid dashboard page.")
+        first_store = TARGET_STORES[0]
+        test_url = (
+            f"https://sellercentral.amazon.co.uk/snowdash"
+            f"?mons_sel_dir_mcid={first_store['merchant_id']}"
+            f"&mons_sel_mkid={first_store['marketplace_id']}"
+        )
+        app_logger.info(f"Verifying session by navigating to dashboard: {test_url}")
+        
+        # *** NEW: Use the trusted check_if_login_needed function for verification ***
+        login_needed = await check_if_login_needed(page, test_url)
+        if login_needed:
+            app_logger.critical("Session verification failed: still requires login after login flow.")
             await _save_screenshot(page, "session_verification_failure")
             return False
 
-        app_logger.info("Session successfully verified.")
         await ctx.storage_state(path=STORAGE_STATE)
         app_logger.info("Saved new session state.")
         return True
+
     except Exception as e:
         app_logger.critical(f"An unexpected error occurred during session priming: {e}", exc_info=True)
         await _save_screenshot(page, "session_priming_error")
         return False
     finally:
         await ctx.close()
+
 
 # =======================================================================================
 #                       CORE SCRAPING LOGIC
