@@ -121,7 +121,8 @@ async def check_if_login_needed(page: Page, test_url: str) -> bool:
         if "signin" in page.url.lower() or "/ap/" in page.url:
             app_logger.info("Session invalid, login required.")
             return True
-        await expect(page.locator("#dashboard-title-component-id")).to_be_visible(timeout=WAIT_TIMEOUT)
+        # Check for a known element on either the metrics or INF dashboard
+        await expect(page.locator("#dashboard-title-component-id, #range-selector")).to_be_visible(timeout=WAIT_TIMEOUT)
         app_logger.info("Existing session still valid.")
         return False
     except Exception:
@@ -132,16 +133,31 @@ async def perform_login(page: Page) -> bool:
     app_logger.info("Starting login flow")
     try:
         await page.goto(LOGIN_URL, timeout=PAGE_TIMEOUT, wait_until="load")
+
+        # Handle multiple possible starting pages
+        email_sel = "input#ap_email"
+        continue_btn = 'button:has-text("Continue shopping")'
+        continue_input = 'input[type="submit"][aria-labelledby="continue-announce"]'
+
+        await page.wait_for_selector(f"{email_sel}, {continue_btn}, {continue_input}", timeout=WAIT_TIMEOUT)
+
+        if await page.locator(continue_btn).is_visible():
+            app_logger.info("Initial 'Continue shopping' interstitial found. Clicking it.")
+            await page.locator(continue_btn).click()
+        elif await page.locator(continue_input).is_visible():
+            app_logger.info("Initial 'Continue' interstitial input found. Clicking it.")
+            await page.locator(continue_input).click()
+        
         email_input = page.get_by_label("Email or mobile phone number")
         await expect(email_input).to_be_visible(timeout=WAIT_TIMEOUT)
         await email_input.fill(config['login_email'])
         await page.get_by_label("Continue").click()
         
         password_selector = 'input#ap_password'
-        continue_shopping_selector = 'button:has-text("Continue shopping")'
-        await page.wait_for_selector(f"{password_selector}, {continue_shopping_selector}", timeout=WAIT_TIMEOUT)
-        if await page.locator(continue_shopping_selector).is_visible():
-            await page.locator(continue_shopping_selector).click()
+        await page.wait_for_selector(f"{password_selector}, {continue_btn}", timeout=WAIT_TIMEOUT)
+        if await page.locator(continue_btn).is_visible():
+            app_logger.info("Interstitial page after email found. Clicking 'Continue shopping'.")
+            await page.locator(continue_btn).click()
         
         pw_input = page.get_by_label("Password")
         await expect(pw_input).to_be_visible(timeout=WAIT_TIMEOUT)
@@ -149,7 +165,7 @@ async def perform_login(page: Page) -> bool:
         await page.get_by_label("Sign in").click()
 
         otp_sel  = 'input[id*="otp"]'
-        dash_sel = "#content"
+        dash_sel = "#dashboard-title-component-id, #range-selector"
         acct_sel = 'h1:has-text("Select an account")'
         await page.wait_for_selector(f"{otp_sel}, {dash_sel}, {acct_sel}", timeout=WAIT_TIMEOUT)
         if await page.locator(otp_sel).is_visible():
@@ -369,9 +385,6 @@ async def post_store_report(data: dict):
     }}]}
     await post_to_webhook(CHAT_WEBHOOK_URL, payload, full_store_name, "per-store")
 
-#
-# *** THIS FUNCTION HAS BEEN UPDATED TO PREVENT TEXT TRUNCATION ***
-#
 async def post_aggregate_summary(results: list):
     successful_results = [r for r in results if r.get("overall", {}).get("store")]
     if not SUMMARY_CHAT_WEBHOOK_URL or not successful_results: return
@@ -386,29 +399,16 @@ async def post_aggregate_summary(results: list):
         fleet_weighted_lates += float(re.sub(r'[^\d.]','',o.get('lates','0'))) * orders
         fleet_weighted_inf += float(re.sub(r'[^\d.]','',o.get('inf','0'))) * units
         
-        # Widget 1: The main metrics
         uph_f = _format_metric_with_color(f"<b>UPH:</b> {o.get('uph')}", UPH_THRESHOLD, True)
         lates_f = _format_metric_with_color(f"<b>Lates:</b> {o.get('lates')}", LATES_THRESHOLD)
         inf_f = _format_metric_with_color(f"<b>INF:</b> {o.get('inf')}", INF_THRESHOLD)
         metrics_text = f"{uph_f} | {lates_f} | {inf_f}"
         
-        store_widgets.append({
-            "decoratedText": {
-                "icon": {"knownIcon": "STORE"},
-                "topLabel": f"<b>{o['store']}</b> ({orders} Orders)",
-                "text": metrics_text
-            }
-        })
+        store_widgets.append({"decoratedText": {"icon":{"knownIcon":"STORE"}, "topLabel":f"<b>{o['store']}</b> ({orders} Orders)", "text":metrics_text}})
         
-        # Widget 2: The Top INF item (if it exists)
         if inf_list:
-            store_widgets.append({
-                "textParagraph": {
-                    "text": f"<i>Top INF: {inf_list[0]['product_name']}</i>"
-                }
-            })
+            store_widgets.append({"textParagraph": {"text": f"<i>Top INF: {inf_list[0]['product_name']}</i>"}})
 
-        # Add a divider between store entries, but not after the last one
         if idx < len(successful_results) - 1:
             store_widgets.append({"divider": {}})
 
