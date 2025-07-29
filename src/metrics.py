@@ -25,6 +25,7 @@ async def scrape_store_metrics(page: Page, store_info: dict) -> dict | None:
 
         customise_btn = page.locator("#content span:has-text('Customised')").nth(0)
         await expect(customise_btn).to_be_visible(timeout=WAIT_TIMEOUT)
+        await page.wait_for_timeout(5000)
         await expect(customise_btn).to_be_enabled(timeout=WAIT_TIMEOUT)
         await customise_btn.click(timeout=ACTION_TIMEOUT)
         await expect(page.locator("kat-date-range-picker")).to_be_visible(timeout=WAIT_TIMEOUT)
