@@ -22,7 +22,14 @@ async def scrape_store_metrics(page: Page, store_info: dict) -> dict | None:
         )
         await page.goto(dash_url, timeout=PAGE_TIMEOUT)
         await expect(page.get_by_role("button", name="Refresh")).to_be_visible(timeout=WAIT_TIMEOUT)
-        await page.locator("#content span:has-text('Customised')").nth(0).click(timeout=ACTION_TIMEOUT)
+
+        customise_btn = page.get_by_role(
+            "button", name=re.compile("Customise", re.I)
+        )
+        await expect(customise_btn).to_be_visible(timeout=WAIT_TIMEOUT)
+        await expect(customise_btn).to_be_enabled(timeout=WAIT_TIMEOUT)
+        await page.wait_for_timeout(5000)  # allow page data to finish loading
+        await customise_btn.click(timeout=ACTION_TIMEOUT)
         await expect(page.locator("kat-date-range-picker")).to_be_visible(timeout=WAIT_TIMEOUT)
         now = datetime.now(LOCAL_TIMEZONE).strftime("%m/%d/%Y")
         date_inputs = page.locator('kat-date-range-picker input[type="text"]')
