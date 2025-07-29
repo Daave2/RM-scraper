@@ -23,7 +23,9 @@ async def scrape_store_metrics(page: Page, store_info: dict) -> dict | None:
         await page.goto(dash_url, timeout=PAGE_TIMEOUT)
         await expect(page.get_by_role("button", name="Refresh")).to_be_visible(timeout=WAIT_TIMEOUT)
 
-        customise_btn = page.locator("#content span:has-text('Customised')").nth(0)
+        customise_btn = page.get_by_role(
+            "button", name=re.compile("Customise", re.I)
+        )
         await expect(customise_btn).to_be_visible(timeout=WAIT_TIMEOUT)
         await expect(customise_btn).to_be_enabled(timeout=WAIT_TIMEOUT)
         await customise_btn.click(timeout=ACTION_TIMEOUT)
